@@ -89,9 +89,11 @@ def generate_guided(
     prop_max_area: float = 0.30,
     edit_mode: str = "base",
     inpaint_strength: float = 0.8,
+    use_coverage: bool = False,
     use_focal: bool = True,
     use_moment: bool = True,
     use_centerline: bool = True,
+    coverage_weight: float = 1.0,
     focal_alpha: float = 0.25,
     focal_beta: float = 2.0,
     focal_weight: float = 3.0,
@@ -158,42 +160,66 @@ def generate_guided(
         token_ids = find_object_token_indices(pipe.tokenizer, prompt, object_phrase, max_length=max_text_tokens)
         print(f"Object tokens for {object_phrase!r}: {token_ids}", flush=True)
 
-        noise_latents, latent_ids = pipe.prepare_latents(
-            batch_size=1,
-            num_latents_channels=pipe.transformer.config.in_channels // 4,
-            height=height,
-            width=width,
-            dtype=prompt_embeds.dtype,
-            device=device,
-            generator=generator,
-            latents=None,
-        )
-
         processed = pipe.image_processor.preprocess(image, height=height, width=width, resize_mode="crop")
-        # Reuse the pipeline's image-latent helper for both reference conditioning
-        # and approximate inpaint initialization.
-        image_latents, image_ids = pipe.prepare_image_latents(
-            images=[processed],
-            batch_size=1,
-            generator=generator,
-            device=device,
-            dtype=pipe.vae.dtype,
-        )
-        image_latents = image_latents.to(dtype=model_dtype)
-
-        if edit_mode == "inpaint":
-            # Approximate inpaint start: begin from a mixture of image latents and noise.
-            latents = (1.0 - inpaint_strength) * image_latents.to(noise_latents.dtype) + inpaint_strength * noise_latents
-            ref_latents, ref_ids = image_latents, image_ids
-        else:
-            latents = noise_latents
-            ref_latents, ref_ids = image_latents, image_ids
 
         sigmas = np.linspace(1.0, 1.0 / num_steps, num_steps)
         if getattr(pipe.scheduler.config, "use_flow_sigmas", False):
             sigmas = None
-        mu = compute_empirical_mu(latents.shape[1], num_steps)
-        timesteps, _ = retrieve_timesteps(pipe.scheduler, num_steps, device, sigmas=sigmas, mu=mu)
+
+        if edit_mode == "inpaint":
+            image_seq_len = (int(height) // pipe.vae_scale_factor // 2) * (int(width) // pipe.vae_scale_factor // 2)
+            mu = compute_empirical_mu(image_seq_len, num_steps)
+            timesteps, _ = retrieve_timesteps(pipe.scheduler, num_steps, device, sigmas=sigmas, mu=mu)
+            # Inpaint pipeline shortens/offsets the schedule according to strength.
+            timesteps, _ = pipe.get_timesteps(num_steps, inpaint_strength, device)
+            latent_timestep = timesteps[:1].repeat(1)
+            latents, init_noise, image_latents, image_latents_encoded, latent_ids = pipe.prepare_latents(
+                processed,
+                latent_timestep,
+                1,
+                pipe.transformer.config.in_channels // 4,
+                height,
+                width,
+                prompt_embeds.dtype,
+                device,
+                generator,
+                None,
+            )
+            # Native inpaint path conditions on encoded source image latents.
+            ref_latents, ref_ids = pipe.prepare_image_latents(
+                images=[image_latents_encoded],
+                batch_size=1,
+                generator=generator,
+                device=device,
+                dtype=prompt_embeds.dtype,
+            )
+            image_latents = image_latents.to(dtype=model_dtype)
+            ref_latents = ref_latents.to(dtype=model_dtype)
+        else:
+            noise_latents, latent_ids = pipe.prepare_latents(
+                batch_size=1,
+                num_latents_channels=pipe.transformer.config.in_channels // 4,
+                height=height,
+                width=width,
+                dtype=prompt_embeds.dtype,
+                device=device,
+                generator=generator,
+                latents=None,
+            )
+            image_latents, image_ids = pipe.prepare_image_latents(
+                images=[processed],
+                batch_size=1,
+                generator=generator,
+                device=device,
+                dtype=pipe.vae.dtype,
+            )
+            image_latents = image_latents.to(dtype=model_dtype)
+            latents = noise_latents
+            ref_latents, ref_ids = image_latents, image_ids
+            init_noise = None
+            mu = compute_empirical_mu(latents.shape[1], num_steps)
+            timesteps, _ = retrieve_timesteps(pipe.scheduler, num_steps, device, sigmas=sigmas, mu=mu)
+
         if hasattr(pipe.scheduler, "set_begin_index"):
             pipe.scheduler.set_begin_index(0)
 
@@ -246,9 +272,11 @@ def generate_guided(
                     target,
                     grid_h,
                     grid_w,
+                    use_coverage=use_coverage,
                     use_focal=use_focal,
                     use_moment=use_moment,
                     use_centerline=use_centerline,
+                    coverage_weight=coverage_weight,
                     focal_alpha=focal_alpha,
                     focal_beta=focal_beta,
                     focal_weight=focal_weight,
@@ -262,8 +290,7 @@ def generate_guided(
                 grad = torch.autograd.grad(loss, x)[0]
                 x_new, grad_rms = normalized_latent_update(x, grad, guidance_strength)
                 latents = x_new.to(dtype=latents.dtype)
-                if edit_mode == "inpaint":
-                    latents = _blend_outside_mask(latents, image_latents.to(latents.dtype), inpaint_mask_grid)
+                # Inpaint preservation is applied after the scheduler step.
                 saved_attention = attn_map.detach()[0, 0].float().cpu()
                 loss_value = float(loss.item())
                 component_values = {k: float(v.item()) for k, v in components.items()}
@@ -284,7 +311,16 @@ def generate_guided(
                 prediction = negative_prediction + cfg_scale * (prediction - negative_prediction)
             latents = pipe.scheduler.step(prediction, t, latents, return_dict=False)[0]
             if edit_mode == "inpaint":
-                latents = _blend_outside_mask(latents, image_latents.to(latents.dtype), inpaint_mask_grid)
+                init_latents_proper = image_latents.to(latents.dtype)
+                if i < len(timesteps) - 1:
+                    noise_timestep = timesteps[i + 1]
+                    init_latents_proper = pipe.scheduler.scale_noise(
+                        init_latents_proper,
+                        torch.tensor([noise_timestep], device=latents.device),
+                        init_noise.to(latents.dtype),
+                    )
+                mask_seq = inpaint_mask_grid.to(latents.device, latents.dtype).unsqueeze(-1)
+                latents = (1.0 - mask_seq) * init_latents_proper + mask_seq * latents
 
         log.append({
             "step": i,
@@ -297,6 +333,7 @@ def generate_guided(
         if component_values is not None:
             print(
                 f"[{i + 1:02d}/{len(timesteps)}] loss={loss_value:.5f} "
+                f"coverage={component_values.get('coverage', 0.0):.5f} "
                 f"focal={component_values.get('focal', 0.0):.5f} "
                 f"moment={component_values.get('moment', 0.0):.5f} "
                 f"centerline={component_values.get('centerline', 0.0):.5f} "

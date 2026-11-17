@@ -75,13 +75,15 @@ def _moment_from_map(attn_obj: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     returns angle, centroid_x, centroid_y with shape [B,C]
     """
     batch_size, obj_num, h, w = attn_obj.shape
-    x, y = torch.meshgrid(
-        torch.arange(0, w, device=attn_obj.device, dtype=attn_obj.dtype),
-        torch.arange(0, h, device=attn_obj.device, dtype=attn_obj.dtype),
+    # Meshgrid is [H,W], matching attn_obj's last two dimensions.
+    # 'y' runs along rows and 'x' runs along columns.
+    y, x = torch.meshgrid(
+        torch.arange(h, device=attn_obj.device, dtype=attn_obj.dtype),
+        torch.arange(w, device=attn_obj.device, dtype=attn_obj.dtype),
         indexing="ij",
     )
-    x = x.expand(batch_size, obj_num, h, w)
-    y = y.expand(batch_size, obj_num, h, w)
+    x = x[None, None].expand(batch_size, obj_num, h, w)
+    y = y[None, None].expand(batch_size, obj_num, h, w)
 
     m00 = torch.sum(attn_obj, dim=(-1, -2))
     m10 = torch.sum(x * attn_obj, dim=(-1, -2))
@@ -93,7 +95,7 @@ def _moment_from_map(attn_obj: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     mu02 = torch.sum((y - y_avg.unsqueeze(-1).unsqueeze(-1)) ** 2 * attn_obj, dim=(-1, -2))
     mu11 = torch.sum((x - x_avg.unsqueeze(-1).unsqueeze(-1)) * (y - y_avg.unsqueeze(-1).unsqueeze(-1)) * attn_obj, dim=(-1, -2))
     angle = 0.5 * torch.atan2(2 * mu11, mu20 - mu02)
-    angle[torch.isnan(angle)] = 0.0
+    angle = torch.nan_to_num(angle, nan=0.0)
     angle = torch.where(angle < 0, angle + math.pi, angle)
     return angle, x_avg, y_avg
 
@@ -127,11 +129,11 @@ def compute_moment_loss(attn_obj: torch.Tensor, scribble: torch.Tensor, alpha: f
     attn_angle, attn_cx, attn_cy = _moment_from_map(norm_attn)
     scrib_angle, scrib_cx, scrib_cy = _moment_from_map(scribble.float())
 
-    r = attn_obj.shape[-1]
-    attn_cx = attn_cx / r
-    attn_cy = attn_cy / r
-    scrib_cx = scrib_cx / r
-    scrib_cy = scrib_cy / r
+    h, w = attn_obj.shape[-2:]
+    attn_cx = attn_cx / w
+    attn_cy = attn_cy / h
+    scrib_cx = scrib_cx / w
+    scrib_cy = scrib_cy / h
 
     centroid_loss = torch.sqrt((attn_cx - scrib_cx) ** 2 + (attn_cy - scrib_cy) ** 2)
     angle_loss = torch.abs(attn_angle - scrib_angle)
@@ -186,9 +188,11 @@ def compute_total_guidance_loss(
     grid_h: int,
     grid_w: int,
     *,
+    use_coverage: bool = False,
     use_focal: bool = True,
     use_moment: bool = True,
     use_centerline: bool = True,
+    coverage_weight: float = 1.0,
     focal_alpha: float = 0.25,
     focal_beta: float = 2.0,
     focal_weight: float = 3.0,
@@ -217,6 +221,14 @@ def compute_total_guidance_loss(
 
     components: dict[str, torch.Tensor] = {}
     total = torch.zeros((), device=attn_map.device, dtype=attn_map.dtype)
+
+    if use_coverage:
+        coverage = attention_coverage_loss(
+            attn_map.reshape(b, -1),
+            (scribble.reshape(b, -1) / scribble.reshape(b, -1).sum(dim=-1, keepdim=True).clamp_min(1e-12))
+        )
+        components["coverage"] = coverage
+        total = total + coverage_weight * coverage
 
     if use_focal:
         focal = compute_focal_loss(attn_map, scribble, alpha=focal_alpha, beta=focal_beta)

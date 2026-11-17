@@ -108,3 +108,7 @@ The UI now includes:
 - `scribble_propagated.png` (if propagation enabled)
 
 `guidance_log.json` now stores loss components for each guided step.
+
+## Rectangular-image moment fix (2026-11-17)
+
+`_moment_from_map` now constructs coordinate grids in `[H,W]` order and normalizes x and y centroids by width and height respectively. Tested with rectangular 21x32/32x21 and square grids including autograd.

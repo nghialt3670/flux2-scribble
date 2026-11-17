@@ -81,8 +81,8 @@ def generate(
     editor, prompt, object_phrase, max_side, steps, guide_steps, strength,
     cfg, blocks_string, seed, device, dtype, cpu_offload,
     mode, inpaint_strength,
-    use_focal, use_moment, use_centerline,
-    focal_alpha, focal_beta, focal_weight,
+    use_coverage, use_focal, use_moment, use_centerline,
+    coverage_weight, focal_alpha, focal_beta, focal_weight,
     moment_alpha, moment_weight, centerline_weight,
     propagate, prop_start, prop_end, prop_blocks_string, prop_top_k,
     prop_threshold, prop_max_area,
@@ -122,7 +122,8 @@ def generate(
             prop_blocks=prop_blocks, prop_top_k=int(prop_top_k),
             prop_threshold=float(prop_threshold), prop_max_area=float(prop_max_area),
             edit_mode=str(mode), inpaint_strength=float(inpaint_strength),
-            use_focal=bool(use_focal), use_moment=bool(use_moment), use_centerline=bool(use_centerline),
+            use_coverage=bool(use_coverage), use_focal=bool(use_focal), use_moment=bool(use_moment), use_centerline=bool(use_centerline),
+            coverage_weight=float(coverage_weight),
             focal_alpha=float(focal_alpha), focal_beta=float(focal_beta), focal_weight=float(focal_weight),
             moment_alpha=float(moment_alpha), moment_weight=float(moment_weight),
             centerline_weight=float(centerline_weight),
@@ -146,9 +147,8 @@ def generate(
             if last.get("components"):
                 c = last["components"]
                 lines.append(
-                    f"Last components — focal: {c.get('focal', 0.0):.5f}, "
-                    f"moment: {c.get('moment', 0.0):.5f}, "
-                    f"centerline: {c.get('centerline', 0.0):.5f}"
+                    f"Last components — coverage: {c.get('coverage', 0.0):.5f}, focal: {c.get('focal', 0.0):.5f}, "
+                    f"moment: {c.get('moment', 0.0):.5f}, centerline: {c.get('centerline', 0.0):.5f}"
                 )
         else:
             lines.append("Guidance disabled")
@@ -186,41 +186,43 @@ def build_ui() -> gr.Blocks:
                 prompt = gr.Textbox(label="Editing prompt", placeholder="Insert a winding red snake following the drawn line", lines=2)
                 object_phrase = gr.Textbox(label="Object phrase in the prompt", placeholder="snake")
                 with gr.Accordion("Pipeline + guidance settings", open=False):
-                    mode = gr.Dropdown(["base", "inpaint"], value="base", label="Pipeline mode")
-                    inpaint_strength = gr.Slider(minimum=0.1, maximum=1.0, value=0.8, step=0.05, label="Inpaint strength")
-                    max_side = gr.Slider(minimum=128, maximum=1024, value=512, step=16, label="Maximum image side (px)")
-                    steps = gr.Slider(minimum=4, maximum=60, value=30, step=1, label="Denoising steps")
-                    guide_steps = gr.Slider(minimum=0, maximum=30, value=10, step=1, label="Early steps with guidance")
-                    strength = gr.Slider(minimum=0.0, maximum=0.1, value=0.01, step=0.001, label="Latent guidance strength")
-                    cfg = gr.Slider(minimum=1, maximum=8, value=4, step=0.5, label="CFG scale")
-                    blocks = gr.Textbox(label="Attention blocks", value="D0,D1,D2,D3,D4")
-                    seed = gr.Number(label="Random seed", value=42, precision=0)
+                    mode = gr.Dropdown(["base", "inpaint"], value="base", label="Pipeline mode", info="Base = normal Klein edit loop. Inpaint = use Klein inpaint pipeline and preserve outside the scribble mask.")
+                    inpaint_strength = gr.Slider(minimum=0.1, maximum=1.0, value=0.8, step=0.05, label="Inpaint strength", info="Only for inpaint mode. Higher = start from noisier latents and allow larger edits.")
+                    max_side = gr.Slider(minimum=128, maximum=1024, value=512, step=16, label="Maximum image side (px)", info="Image is resized so its long side does not exceed this value.")
+                    steps = gr.Slider(minimum=4, maximum=60, value=30, step=1, label="Denoising steps", info="Total sampling steps. More steps are slower but may improve quality.")
+                    guide_steps = gr.Slider(minimum=0, maximum=30, value=10, step=1, label="Early steps with guidance", info="How many early denoising steps receive scribble guidance.")
+                    strength = gr.Slider(minimum=0.0, maximum=0.1, value=0.01, step=0.001, label="Latent guidance strength", info="Step size for the latent update from the guidance gradient.")
+                    cfg = gr.Slider(minimum=1, maximum=8, value=4, step=0.5, label="CFG scale", info="Classifier-free guidance scale for prompt adherence.")
+                    blocks = gr.Textbox(label="Attention blocks", value="D0,D1,D2,D3,D4", info="Blocks used to collect image-to-text attention for the guidance loss.")
+                    seed = gr.Number(label="Random seed", value=42, precision=0, info="Use the same seed to compare settings.")
                     with gr.Row():
-                        device = gr.Dropdown(["auto", "cuda", "mps", "cpu"], value="auto", label="Device")
-                        dtype = gr.Dropdown(["auto", "bf16", "fp32"], value="auto", label="Model dtype")
-                    cpu_offload = gr.Checkbox(value=False, label="CPU offload (CUDA only)")
+                        device = gr.Dropdown(["auto", "cuda", "mps", "cpu"], value="auto", label="Device", info="Where to run the model.")
+                        dtype = gr.Dropdown(["auto", "bf16", "fp32"], value="auto", label="Model dtype", info="bf16 is faster/lighter on supported GPUs. fp32 is more stable but heavier.")
+                    cpu_offload = gr.Checkbox(value=False, label="CPU offload (CUDA only)", info="Moves parts of the model between CPU and GPU to save VRAM.")
                 with gr.Accordion("Loss settings", open=False):
-                    use_focal = gr.Checkbox(value=True, label="Use ScribbleDiff focal loss")
-                    use_moment = gr.Checkbox(value=True, label="Use ScribbleDiff moment loss")
-                    use_centerline = gr.Checkbox(value=True, label="Use centerline loss")
+                    use_coverage = gr.Checkbox(value=False, label="Use old coverage loss", info="The original simple loss: make attention cover the scribble region.")
+                    use_focal = gr.Checkbox(value=True, label="Use ScribbleDiff focal loss", info="Pixel-wise focal objective on attention vs. the scribble mask.")
+                    use_moment = gr.Checkbox(value=True, label="Use ScribbleDiff moment loss", info="Matches centroid and orientation of the attention map to the scribble.")
+                    use_centerline = gr.Checkbox(value=True, label="Use centerline loss", info="Penalizes attention far from the scribble centerline.")
                     with gr.Row():
-                        focal_alpha = gr.Number(value=0.25, label="Focal alpha")
-                        focal_beta = gr.Number(value=2.0, label="Focal beta")
-                        focal_weight = gr.Number(value=3.0, label="Focal weight")
+                        coverage_weight = gr.Number(value=1.0, label="Coverage weight", info="Weight of the old coverage loss in the total loss.")
+                        focal_alpha = gr.Number(value=0.25, label="Focal alpha", info="Class-balancing term in focal loss.")
+                        focal_beta = gr.Number(value=2.0, label="Focal beta", info="Focusing term in focal loss.")
+                        focal_weight = gr.Number(value=3.0, label="Focal weight", info="Weight of the focal loss in the total loss.")
                     with gr.Row():
-                        moment_alpha = gr.Number(value=1.0, label="Moment angle alpha")
-                        moment_weight = gr.Number(value=1.0, label="Moment weight")
-                        centerline_weight = gr.Number(value=1.0, label="Centerline weight")
+                        moment_alpha = gr.Number(value=1.0, label="Moment angle alpha", info="Extra weight on the orientation part inside the moment loss.")
+                        moment_weight = gr.Number(value=1.0, label="Moment weight", info="Weight of the moment loss in the total loss.")
+                        centerline_weight = gr.Number(value=1.0, label="Centerline weight", info="Weight of the centerline loss in the total loss.")
                 with gr.Accordion("Self-attention scribble propagation", open=True):
-                    propagate = gr.Checkbox(value=True, label="Enable scribble propagation")
+                    propagate = gr.Checkbox(value=True, label="Enable scribble propagation", info="Grow sparse scribbles into a larger target region using self-attention.")
                     with gr.Row():
-                        prop_start = gr.Slider(minimum=0, maximum=30, value=3, step=1, label="Start step")
-                        prop_end = gr.Slider(minimum=0, maximum=30, value=10, step=1, label="End step (exclusive)")
-                    prop_blocks = gr.Textbox(label="Self-attention blocks", value="D2,D3")
+                        prop_start = gr.Slider(minimum=0, maximum=30, value=3, step=1, label="Start step", info="First timestep where propagation is allowed.")
+                        prop_end = gr.Slider(minimum=0, maximum=30, value=10, step=1, label="End step (exclusive)", info="Propagation stops before this timestep.")
+                    prop_blocks = gr.Textbox(label="Self-attention blocks", value="D2,D3", info="Blocks used to extract self-attention for propagation.")
                     with gr.Row():
-                        prop_top_k = gr.Slider(minimum=1, maximum=64, value=12, step=1, label="Max new cells per step")
-                        prop_threshold = gr.Slider(minimum=0.001, maximum=2.0, value=0.2, step=0.001, label="Maximum symmetric KL")
-                    prop_max_area = gr.Slider(minimum=0.05, maximum=1.0, value=0.3, step=0.05, label="Maximum expanded grid fraction")
+                        prop_top_k = gr.Slider(minimum=1, maximum=64, value=12, step=1, label="Max new cells per step", info="Limits how many new grid cells can be added per propagation step.")
+                        prop_threshold = gr.Slider(minimum=0.001, maximum=2.0, value=0.2, step=0.001, label="Maximum symmetric KL", info="Smaller values make propagation stricter.")
+                    prop_max_area = gr.Slider(minimum=0.05, maximum=1.0, value=0.3, step=0.05, label="Maximum expanded grid fraction", info="Upper bound on total propagated area as a fraction of the attention grid.")
                 submit = gr.Button("Generate edited image", variant="primary")
             with gr.Column(scale=1):
                 output = gr.Image(label="Generated image", type="pil")
@@ -244,8 +246,8 @@ def build_ui() -> gr.Blocks:
                 editor, prompt, object_phrase, max_side, steps, guide_steps, strength,
                 cfg, blocks, seed, device, dtype, cpu_offload,
                 mode, inpaint_strength,
-                use_focal, use_moment, use_centerline,
-                focal_alpha, focal_beta, focal_weight,
+                use_coverage, use_focal, use_moment, use_centerline,
+                coverage_weight, focal_alpha, focal_beta, focal_weight,
                 moment_alpha, moment_weight, centerline_weight,
                 propagate, prop_start, prop_end, prop_blocks, prop_top_k,
                 prop_threshold, prop_max_area,
