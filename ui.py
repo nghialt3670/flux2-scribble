@@ -1,9 +1,4 @@
-"""Gradio drawing UI for FLUX.2 Klein Scribble Guidance.
-
-Run: uv run python ui.py
-Upload a reference image, paint a red line directly on it, then click Generate.
-Model weights are loaded on the first run, not when opening the UI.
-"""
+"""Gradio drawing UI for FLUX.2 Klein Scribble Guidance."""
 from __future__ import annotations
 
 import argparse
@@ -24,13 +19,6 @@ MODEL = "black-forest-labs/FLUX.2-klein-base-4B"
 
 
 def editor_to_images(editor: dict | None) -> tuple[Image.Image, Image.Image]:
-    """Extract original background and stroke alpha mask, never the composite.
-
-    Gradio ImageEditor returns {background, layers, composite}. Every layer is
-    a transparent RGBA painting surface; the alpha channels carry the strokes.
-    Using the composite as the input would mistakenly bake red strokes into
-    the source image, so we deliberately use *background* as the reference.
-    """
     if not editor or editor.get("background") is None:
         raise ValueError("Upload an image in the drawing canvas first")
     background = editor["background"]
@@ -44,13 +32,12 @@ def editor_to_images(editor: dict | None) -> tuple[Image.Image, Image.Image]:
         layer = layer if isinstance(layer, Image.Image) else Image.fromarray(np.asarray(layer))
         if layer.size != (w, h):
             raise ValueError(f"Canvas layer {layer.size} does not match image {(w, h)}")
-        # A drawing layer is RGBA with transparent pixels around the strokes.
         if "A" not in layer.getbands():
             raise ValueError("Drawing layer has no transparency; use the ImageEditor brush")
         alpha = np.asarray(layer.getchannel("A"), dtype=np.uint8)
         stroke = np.maximum(stroke, alpha)
     if not stroke.any():
-        raise ValueError("Draw a red scribble on the image (using the brush) before generating")
+        raise ValueError("Draw a red scribble on the image before generating")
     return background, Image.fromarray(stroke, "L")
 
 
@@ -72,14 +59,14 @@ def _device_and_dtype(selection: str, dtype_name: str):
     return device, dtype
 
 
-@functools.lru_cache(maxsize=1)
-def _load_model(device_selection: str, dtype_name: str, cpu_offload: bool):
-    # Import at use time so the drawing UI can start without loading 4B weights.
-    from diffusers import Flux2KleinPipeline
+@functools.lru_cache(maxsize=8)
+def _load_model(mode: str, device_selection: str, dtype_name: str, cpu_offload: bool):
+    from diffusers import Flux2KleinInpaintPipeline, Flux2KleinPipeline
 
     device, dtype = _device_and_dtype(device_selection, dtype_name)
-    print(f"Loading {MODEL} on {device}, dtype={dtype}", flush=True)
-    pipe = Flux2KleinPipeline.from_pretrained(MODEL, torch_dtype=dtype)
+    pipe_cls = Flux2KleinPipeline if mode == "base" else Flux2KleinInpaintPipeline
+    print(f"Loading {MODEL} in {mode} mode on {device}, dtype={dtype}", flush=True)
+    pipe = pipe_cls.from_pretrained(MODEL, torch_dtype=dtype)
     if cpu_offload:
         if device != "cuda":
             raise ValueError("CPU offload is supported here only with the CUDA backend")
@@ -93,6 +80,10 @@ def _load_model(device_selection: str, dtype_name: str, cpu_offload: bool):
 def generate(
     editor, prompt, object_phrase, max_side, steps, guide_steps, strength,
     cfg, blocks_string, seed, device, dtype, cpu_offload,
+    mode, inpaint_strength,
+    use_focal, use_moment, use_centerline,
+    focal_alpha, focal_beta, focal_weight,
+    moment_alpha, moment_weight, centerline_weight,
     propagate, prop_start, prop_end, prop_blocks_string, prop_top_k,
     prop_threshold, prop_max_area,
     progress=gr.Progress(),
@@ -101,7 +92,7 @@ def generate(
         if not prompt or not prompt.strip():
             raise ValueError("Enter an editing prompt")
         if not object_phrase or object_phrase.lower() not in prompt.lower():
-            raise ValueError("Object phrase must appear in the editing prompt (e.g. 'cat')")
+            raise ValueError("Object phrase must appear in the editing prompt")
         if int(guide_steps) > int(steps):
             raise ValueError("Guided steps cannot exceed total steps")
         blocks = [s.strip().upper() for s in blocks_string.split(",") if s.strip()]
@@ -113,8 +104,8 @@ def generate(
 
         original, stroke = editor_to_images(editor)
         image, mask, mask_tensor, original_size = prepare_inputs(original, stroke, int(max_side))
-        progress(0.1, desc="Loading FLUX.2 Klein (first run may download weights)")
-        pipe = _load_model(device, dtype, bool(cpu_offload))
+        progress(0.1, desc="Loading FLUX.2 Klein")
+        pipe = _load_model(mode, device, dtype, bool(cpu_offload))
         from pipeline import generate_guided
 
         destination = Path("outputs") / f"ui_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
@@ -130,6 +121,11 @@ def generate(
             propagate=bool(propagate), prop_start=int(prop_start), prop_end=int(prop_end),
             prop_blocks=prop_blocks, prop_top_k=int(prop_top_k),
             prop_threshold=float(prop_threshold), prop_max_area=float(prop_max_area),
+            edit_mode=str(mode), inpaint_strength=float(inpaint_strength),
+            use_focal=bool(use_focal), use_moment=bool(use_moment), use_centerline=bool(use_centerline),
+            focal_alpha=float(focal_alpha), focal_beta=float(focal_beta), focal_weight=float(focal_weight),
+            moment_alpha=float(moment_alpha), moment_weight=float(moment_weight),
+            centerline_weight=float(centerline_weight),
         )
         result.save(destination / "result_native.png")
         if result.size != original_size:
@@ -137,12 +133,26 @@ def generate(
         result.save(destination / "result.png")
         save_summary(image, mask, result, info["last_attention"], destination / "summary.png")
         progress(1.0, desc="Complete")
-        lines = [f"Saved to {destination}", f"Native inference resolution: {image.width}x{image.height}"]
+
+        lines = [
+            f"Saved to {destination}",
+            f"Mode: {mode}",
+            f"Native inference resolution: {image.width}x{image.height}",
+        ]
         guided = [e for e in info["log"] if e["loss"] is not None]
         if guided:
-            lines.append(f"Guided steps: {len(guided)}; initial loss: {guided[0]['loss']:.5f}; last logged loss: {guided[-1]['loss']:.5f}")
+            last = guided[-1]
+            lines.append(f"Guided steps: {len(guided)}; last total loss: {last['loss']:.5f}")
+            if last.get("components"):
+                c = last["components"]
+                lines.append(
+                    f"Last components — focal: {c.get('focal', 0.0):.5f}, "
+                    f"moment: {c.get('moment', 0.0):.5f}, "
+                    f"centerline: {c.get('centerline', 0.0):.5f}"
+                )
         else:
             lines.append("Guidance disabled")
+
         propagated = (
             Image.open(destination / "scribble_propagated.png").copy()
             if bool(propagate) and (destination / "scribble_propagated.png").exists()
@@ -158,12 +168,16 @@ def generate(
 
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="FLUX.2 Klein — Scribble Guidance") as demo:
-        gr.Markdown("## FLUX.2 Klein — Draw-to-insert\nUpload an image, **draw a red scribble over it**, enter a prompt containing the object name, and click Generate. The red line is used for guidance, **not** fed into Klein as image pixels.")
+        gr.Markdown(
+            "## FLUX.2 Klein — Draw-to-edit\n"
+            "Upload an image, draw a red scribble, enter a prompt containing the object name, and click Generate."
+        )
         with gr.Row():
             with gr.Column(scale=1):
                 editor = gr.ImageEditor(
                     label="Input image + scribble (draw in red)", type="pil", image_mode="RGBA",
-                    sources=["upload", "clipboard"], brush=gr.Brush(default_size=12, colors=["#FF0000"], default_color="#FF0000", color_mode="fixed"),
+                    sources=["upload", "clipboard"],
+                    brush=gr.Brush(default_size=12, colors=["#FF0000"], default_color="#FF0000", color_mode="fixed"),
                     layers=False, transforms=(), height=440,
                 )
                 with gr.Row():
@@ -171,7 +185,9 @@ def build_ui() -> gr.Blocks:
                     clear = gr.Button("Clear scribble (keep image)", size="sm")
                 prompt = gr.Textbox(label="Editing prompt", placeholder="Insert a winding red snake following the drawn line", lines=2)
                 object_phrase = gr.Textbox(label="Object phrase in the prompt", placeholder="snake")
-                with gr.Accordion("Guidance settings", open=False):
+                with gr.Accordion("Pipeline + guidance settings", open=False):
+                    mode = gr.Dropdown(["base", "inpaint"], value="base", label="Pipeline mode")
+                    inpaint_strength = gr.Slider(minimum=0.1, maximum=1.0, value=0.8, step=0.05, label="Inpaint strength")
                     max_side = gr.Slider(minimum=128, maximum=1024, value=512, step=16, label="Maximum image side (px)")
                     steps = gr.Slider(minimum=4, maximum=60, value=30, step=1, label="Denoising steps")
                     guide_steps = gr.Slider(minimum=0, maximum=30, value=10, step=1, label="Early steps with guidance")
@@ -183,9 +199,20 @@ def build_ui() -> gr.Blocks:
                         device = gr.Dropdown(["auto", "cuda", "mps", "cpu"], value="auto", label="Device")
                         dtype = gr.Dropdown(["auto", "bf16", "fp32"], value="auto", label="Model dtype")
                     cpu_offload = gr.Checkbox(value=False, label="CPU offload (CUDA only)")
+                with gr.Accordion("Loss settings", open=False):
+                    use_focal = gr.Checkbox(value=True, label="Use ScribbleDiff focal loss")
+                    use_moment = gr.Checkbox(value=True, label="Use ScribbleDiff moment loss")
+                    use_centerline = gr.Checkbox(value=True, label="Use centerline loss")
+                    with gr.Row():
+                        focal_alpha = gr.Number(value=0.25, label="Focal alpha")
+                        focal_beta = gr.Number(value=2.0, label="Focal beta")
+                        focal_weight = gr.Number(value=3.0, label="Focal weight")
+                    with gr.Row():
+                        moment_alpha = gr.Number(value=1.0, label="Moment angle alpha")
+                        moment_weight = gr.Number(value=1.0, label="Moment weight")
+                        centerline_weight = gr.Number(value=1.0, label="Centerline weight")
                 with gr.Accordion("Self-attention scribble propagation", open=True):
                     propagate = gr.Checkbox(value=True, label="Enable scribble propagation")
-                    gr.Markdown("Grow the drawn stroke into nearby regions with similar **image-to-image self-attention**. End step is exclusive; expansion is limited by top-k and KL threshold.")
                     with gr.Row():
                         prop_start = gr.Slider(minimum=0, maximum=30, value=3, step=1, label="Start step")
                         prop_end = gr.Slider(minimum=0, maximum=30, value=10, step=1, label="End step (exclusive)")
@@ -200,7 +227,7 @@ def build_ui() -> gr.Blocks:
                 mask_preview = gr.Image(label="Original scribble mask", type="pil", image_mode="L")
                 prop_preview = gr.Image(label="Propagated scribble mask", type="pil", image_mode="L")
                 summary = gr.Image(label="Attention and result summary")
-                status = gr.Textbox(label="Run details", interactive=False, lines=3)
+                status = gr.Textbox(label="Run details", interactive=False, lines=5)
 
         check.click(preview_stroke, inputs=[editor], outputs=[mask_preview])
 
@@ -213,10 +240,16 @@ def build_ui() -> gr.Blocks:
         clear.click(reset_strokes, inputs=[editor], outputs=[editor])
         submit.click(
             generate,
-            inputs=[editor, prompt, object_phrase, max_side, steps, guide_steps, strength,
-                    cfg, blocks, seed, device, dtype, cpu_offload,
-                    propagate, prop_start, prop_end, prop_blocks, prop_top_k,
-                    prop_threshold, prop_max_area],
+            inputs=[
+                editor, prompt, object_phrase, max_side, steps, guide_steps, strength,
+                cfg, blocks, seed, device, dtype, cpu_offload,
+                mode, inpaint_strength,
+                use_focal, use_moment, use_centerline,
+                focal_alpha, focal_beta, focal_weight,
+                moment_alpha, moment_weight, centerline_weight,
+                propagate, prop_start, prop_end, prop_blocks, prop_top_k,
+                prop_threshold, prop_max_area,
+            ],
             outputs=[output, mask_preview, prop_preview, summary, status],
             concurrency_limit=1,
         )
@@ -229,7 +262,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--inbrowser", action="store_true")
     args = parser.parse_args()
-    build_ui().queue().launch(server_name=args.host, server_port=args.port, inbrowser=args.inbrowser)
+    build_ui().queue().launch(server_name=args.host, server_port=args.port, inbrowser=args.inbrowser, share=True)
 
 
 if __name__ == "__main__":
