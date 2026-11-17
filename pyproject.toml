@@ -1,0 +1,15 @@
+[project]
+name = "flux2-scribble-guidance"
+version = "0.1.0"
+description = "Training-free scribble attention guidance for FLUX.2 Klein Base"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "torch>=2.6",
+    "diffusers @ git+https://github.com/huggingface/diffusers.git",
+    "transformers>=4.57",
+    "accelerate>=1.5",
+    "safetensors>=0.5",
+    "pillow>=11",
+    "numpy>=2.0",
+    "matplotlib>=3.9",
+]
