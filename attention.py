@@ -24,13 +24,16 @@ class AttentionCollector:
         n_output_image_tokens: int,
         blocks: list[str],
         query_chunk: int = 64,
+        self_blocks: list[str] | None = None,
     ):
         self.transformer = transformer
         self.tokens = target_text_tokens
         self.n_output = n_output_image_tokens
         self.blocks = blocks
+        self.self_blocks = self_blocks or []
         self.query_chunk = query_chunk
         self.maps: dict[str, torch.Tensor] = {}
+        self.self_maps: dict[str, torch.Tensor] = {}
         if not self.tokens:
             raise ValueError("Target object text token selection is empty")
 
@@ -81,33 +84,55 @@ class AttentionCollector:
             q = apply_rotary_emb(q, rotary, sequence_dim=1)
             k = apply_rotary_emb(k, rotary, sequence_dim=1)
 
-        q = q[:, text_len : text_len + self.n_output]
-        if q.shape[1] != self.n_output:
-            raise RuntimeError(f"Expected {self.n_output} output-image queries, got {q.shape[1]}")
-        if max(self.tokens) >= text_len:
-            raise RuntimeError(f"Target token index exceeds text sequence of length {text_len}")
+        if name in self.blocks:
+            q_cross = q[:, text_len : text_len + self.n_output]
+            if q_cross.shape[1] != self.n_output:
+                raise RuntimeError(f"Expected {self.n_output} output-image queries, got {q_cross.shape[1]}")
+            if max(self.tokens) >= text_len:
+                raise RuntimeError(f"Target token index exceeds text sequence of length {text_len}")
 
-        # Exact probability mass in target text tokens, normalized over ALL
-        # text + output image + reference image keys (not text-only softmax).
-        k = k.transpose(1, 2).float()  # [B,H,Lkeys,D]
-        q = q.transpose(1, 2).float()  # [B,H,Lout,D]
-        inds = torch.tensor(self.tokens, device=q.device, dtype=torch.long)
-        chunks = []
-        for pos in range(0, q.shape[2], self.query_chunk):
-            logits = (q[:, :, pos : pos + self.query_chunk] @ k.transpose(-1, -2)) / math.sqrt(head_dim)
-            numer = logits.index_select(-1, inds).logsumexp(dim=-1)
-            denom = logits.logsumexp(dim=-1)
-            # Average heads; keep gradients all the way to the noisy latent.
-            chunks.append(torch.exp(numer - denom).mean(dim=1))
-        self.maps[name] = torch.cat(chunks, dim=1)
+            # Exact image -> object-token probability mass, normalized over ALL
+            # text, output-image and reference-image keys.
+            k_all = k.transpose(1, 2).float()  # [B,H,Lkeys,D]
+            q_cross = q_cross.transpose(1, 2).float()  # [B,H,Lout,D]
+            inds = torch.tensor(self.tokens, device=q_cross.device, dtype=torch.long)
+            chunks = []
+            for pos in range(0, q_cross.shape[2], self.query_chunk):
+                logits = (q_cross[:, :, pos : pos + self.query_chunk] @ k_all.transpose(-1, -2)) / math.sqrt(head_dim)
+                numer = logits.index_select(-1, inds).logsumexp(dim=-1)
+                denom = logits.logsumexp(dim=-1)
+                chunks.append(torch.exp(numer - denom).mean(dim=1))
+            self.maps[name] = torch.cat(chunks, dim=1)
+
+        if name in self._active_self_blocks:
+            # Klein has joint attention, unlike the U-Net's separate spatial
+            # self-attention. Restrict BOTH queries and keys to OUTPUT image
+            # tokens; renormalize rows over those keys. Never include reference
+            # image tokens in the propagated spatial mask.
+            with torch.no_grad():
+                lo, hi = text_len, text_len + self.n_output
+                q_image = q[:, lo:hi].detach().transpose(1, 2).float()
+                k_image = k[:, lo:hi].detach().transpose(1, 2).float()
+                if q_image.shape[2] != self.n_output or k_image.shape[2] != self.n_output:
+                    raise RuntimeError("Output-image token indices do not match model tokens")
+                keys_t = k_image.transpose(-1, -2)
+                pieces = []
+                for pos in range(0, self.n_output, self.query_chunk):
+                    logits = (q_image[:, :, pos:pos + self.query_chunk] @ keys_t) / math.sqrt(head_dim)
+                    # Average head probabilities; final [B,N,N] is manageable
+                    # at 512px (32x32 = 1024 image tokens).
+                    pieces.append(logits.softmax(dim=-1).mean(dim=1))
+                self.self_maps[name] = torch.cat(pieces, dim=1)
 
     @contextmanager
-    def capture(self, text_len: int):
+    def capture(self, text_len: int, *, capture_self: bool = False):
         self.text_len = text_len
         self.maps = {}
+        self.self_maps = {}
+        self._active_self_blocks = self.self_blocks if capture_self else []
         handles = []
         try:
-            for name in self.blocks:
+            for name in dict.fromkeys([*self.blocks, *self._active_self_blocks]):
                 module = self.block_module(self.transformer, name)
 
                 def hook(attn, args, kwargs, _name=name):
@@ -120,6 +145,15 @@ class AttentionCollector:
         finally:
             for h in handles:
                 h.remove()
+
+    def mean_self_map(self) -> torch.Tensor:
+        """Average normalized output-image self-attention over chosen blocks."""
+        absent = set(self._active_self_blocks) - set(self.self_maps)
+        if absent:
+            raise RuntimeError(f"Self-attention hooks not called: {sorted(absent)}")
+        if not self._active_self_blocks:
+            raise ValueError("No self-attention blocks configured for propagation")
+        return torch.stack([self.self_maps[name] for name in self._active_self_blocks]).mean(dim=0)
 
     def mean_map(self) -> torch.Tensor:
         absent = set(self.blocks) - set(self.maps)

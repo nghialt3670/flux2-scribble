@@ -53,6 +53,13 @@ def main():
     parser.add_argument("--max-text-tokens", type=int, default=256)
     parser.add_argument("--query-chunk", type=int, default=64)
     parser.add_argument("--cpu-offload", action="store_true", help="Enable model CPU offload (mostly CUDA)")
+    parser.add_argument("--propagate", action="store_true", help="Enable self-attention-guided scribble propagation")
+    parser.add_argument("--prop-start", type=int, default=3, help="First propagation step (zero-indexed)")
+    parser.add_argument("--prop-end", type=int, default=10, help="Exclusive propagation end step")
+    parser.add_argument("--prop-blocks", default="D2,D3", help="Self-attention blocks for propagation")
+    parser.add_argument("--prop-top-k", type=int, default=12, help="Max new grid cells per propagation step")
+    parser.add_argument("--prop-threshold", type=float, default=0.2, help="Maximum symmetric KL (different scale from original ScribbleDiff)")
+    parser.add_argument("--prop-max-area", type=float, default=0.30, help="Maximum fraction of image grid to grow into")
     args = parser.parse_args()
 
     if args.max_side < 32:
@@ -86,6 +93,11 @@ def main():
         guidance_strength=args.strength, cfg_scale=args.cfg,
         blocks=blocks, seed=args.seed, max_text_tokens=args.max_text_tokens,
         attention_query_chunk=args.query_chunk, debug_dir=out,
+        propagate=args.propagate, prop_start=args.prop_start,
+        prop_end=args.prop_end,
+        prop_blocks=[part.strip().upper() for part in args.prop_blocks.split(",") if part.strip()],
+        prop_top_k=args.prop_top_k, prop_threshold=args.prop_threshold,
+        prop_max_area=args.prop_max_area,
     )
     result.save(out / "result_native.png")
     # Output file matches input dimensions. If not divisible by 16, this final

@@ -16,6 +16,7 @@ from diffusers.utils.torch_utils import get_module_execution_device
 
 from attention import AttentionCollector, find_object_token_indices
 from guidance import attention_coverage_loss, normalized_latent_update, scribble_target
+from propagation import ScribblePropagator
 
 
 def _forward(
@@ -68,6 +69,13 @@ def generate_guided(
     max_text_tokens: int = 256,
     attention_query_chunk: int = 64,
     debug_dir: str | Path | None = None,
+    propagate: bool = False,
+    prop_start: int = 3,
+    prop_end: int = 10,
+    prop_blocks: list[str] | None = None,
+    prop_top_k: int = 12,
+    prop_threshold: float = 0.2,
+    prop_max_area: float = 0.30,
 ):
     """Return (PIL output, stats). Image and scribble are already resized together.
 
@@ -80,6 +88,13 @@ def generate_guided(
         raise ValueError("CFG scale must be >= 1")
     if guidance_strength < 0:
         raise ValueError("Guidance strength must be nonnegative")
+    if not 0 <= prop_start <= prop_end:
+        raise ValueError("Require 0 <= prop_start <= prop_end (end is exclusive)")
+    if prop_blocks is None:
+        prop_blocks = ["D2", "D3"]
+    propagation_enabled = bool(propagate and guidance_strength > 0 and guide_steps > 0)
+    if propagation_enabled and not prop_blocks:
+        raise ValueError("Propagation requires at least one self-attention block")
     if blocks is None:
         blocks = [f"D{i}" for i in range(len(pipe.transformer.transformer_blocks))]
     if not blocks and guide_steps:
@@ -162,19 +177,34 @@ def generate_guided(
     if grid_h * grid_w != latents.shape[1]:
         raise RuntimeError("Packed output-token count does not match spatial grid")
     target = scribble_target(scribble_mask.to(device), grid_h, grid_w)
+    propagator = (
+        ScribblePropagator(
+            scribble_mask.to(device), grid_h, grid_w,
+            top_k=prop_top_k, threshold=prop_threshold,
+            max_area_ratio=prop_max_area,
+        )
+        if propagation_enabled else None
+    )
     collector = AttentionCollector(
         pipe.transformer, token_ids, latents.shape[1], blocks,
         query_chunk=attention_query_chunk,
+        self_blocks=prop_blocks if propagation_enabled else [],
     )
     saved_attention = None
     log = []
+    prop_history = []
 
     for i, t in enumerate(timesteps):
         if i < guide_steps and guidance_strength > 0:
+            # Capture self-attention on the SAME model forward used for the
+            # guidance loss: no additional denoising/inference pass required.
+            do_propagate = bool(
+                propagator is not None and prop_start <= i < min(prop_end, guide_steps)
+            )
             with torch.enable_grad():
                 # Keep a FP32 leaf even when Klein runs with BF16 weights.
                 x = latents.detach().float().requires_grad_(True)
-                with collector.capture(text_len=prompt_embeds.shape[1]):
+                with collector.capture(text_len=prompt_embeds.shape[1], capture_self=do_propagate):
                     # Velocity output is intentionally discarded; the backward
                     # pass uses only the differentiable attention maps.
                     _ = _forward(
@@ -182,6 +212,17 @@ def generate_guided(
                         latent_ids, ref_latents, ref_ids, "cond"
                     )
                 attention = collector.mean_map()
+                prop_event = None
+                if do_propagate:
+                    # The self-attention distributions were detached inside
+                    # attention.py. Region growth is a discrete, no-grad step.
+                    prop_event = propagator.propagate(collector.mean_self_map())
+                    target = propagator.target()
+                    prop_history.append({
+                        "step": i,
+                        **prop_event,
+                        "mask": propagator.active[0].detach().cpu().clone(),
+                    })
                 loss = attention_coverage_loss(attention, target)
                 grad = torch.autograd.grad(loss, x)[0]
                 x_new, grad_rms = normalized_latent_update(x, grad, guidance_strength)
@@ -190,8 +231,9 @@ def generate_guided(
                 loss_value = loss.item()
                 del x, attention, loss, grad, x_new
                 collector.maps.clear()
+                collector.self_maps.clear()
         else:
-            loss_value, grad_rms = None, None
+            loss_value, grad_rms, prop_event = None, None, None
 
         # Actual Euler flow step on the UPDATED latent (both CFG branches).
         with torch.no_grad():
@@ -206,7 +248,13 @@ def generate_guided(
                 )
                 prediction = negative_prediction + cfg_scale * (prediction - negative_prediction)
             latents = pipe.scheduler.step(prediction, t, latents, return_dict=False)[0]
-        log.append({"step": i, "timestep": float(t.item()), "loss": loss_value, "grad_rms": grad_rms})
+        log.append({
+            "step": i,
+            "timestep": float(t.item()),
+            "loss": loss_value,
+            "grad_rms": grad_rms,
+            "propagation": prop_event,
+        })
         if loss_value is not None:
             print(f"[{i + 1:02d}/{len(timesteps)}] loss={loss_value:.5f} grad_rms={grad_rms:.3e}", flush=True)
         else:
@@ -236,4 +284,27 @@ def generate_guided(
         (dest / "guidance_log.json").write_text(json.dumps(log, indent=2))
         if saved_attention is not None:
             np.save(dest / "attention_last_guided.npy", saved_attention.numpy())
-    return output, {"log": log, "last_attention": saved_attention, "target_grid": target.detach().cpu()}
+        if propagator is not None:
+            from PIL import Image
+            from torch.nn import functional as F
+            final_mask = F.interpolate(
+                propagator.active[:, None].float(), size=(height, width), mode="nearest"
+            )[0, 0].detach().cpu().numpy()
+            Image.fromarray((final_mask * 255).astype(np.uint8), "L").save(dest / "scribble_propagated.png")
+            mask_dest = dest / "propagation_history"
+            mask_dest.mkdir(parents=True, exist_ok=True)
+            for item in prop_history:
+                mask = F.interpolate(
+                    item["mask"][None, None].float(), size=(height, width), mode="nearest"
+                )[0, 0].numpy()
+                Image.fromarray((mask * 255).astype(np.uint8), "L").save(
+                    mask_dest / f"step_{item['step']:03d}.png"
+                )
+    final_grid = (propagator.active[0].detach().cpu().clone() if propagator is not None
+                  else (target[0].reshape(grid_h, grid_w) > 0).detach().cpu())
+    return output, {
+        "log": log,
+        "last_attention": saved_attention,
+        "target_grid": target.detach().cpu(),
+        "propagated_mask": final_grid,
+    }
