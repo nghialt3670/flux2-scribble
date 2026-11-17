@@ -10,6 +10,7 @@ from PIL import Image, ImageOps
 from diffusers import Flux2KleinPipeline
 
 from pipeline import generate_guided
+from input_utils import prepare_inputs
 from visualize import save_summary
 
 MODEL = "black-forest-labs/FLUX.2-klein-base-4B"
@@ -18,7 +19,6 @@ MODEL = "black-forest-labs/FLUX.2-klein-base-4B"
 def load_inputs(image_path: str, scribble_path: str, max_side: int, polarity: str):
     image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
     scribble = ImageOps.exif_transpose(Image.open(scribble_path))
-    original_size = image.size
     if scribble.size != image.size:
         raise ValueError(f"Scribble size {scribble.size} must match image size {image.size}")
     if polarity == "alpha":
@@ -30,15 +30,7 @@ def load_inputs(image_path: str, scribble_path: str, max_side: int, polarity: st
         mask = (gray >= 128 if polarity == "light" else gray <= 127).astype(np.uint8) * 255
     if not mask.any():
         raise ValueError("Empty scribble mask. For black strokes on white, use --polarity dark")
-    # Keep aspect ratio approximately; round to the native 16-pixel multiple.
-    scale = min(1.0, max_side / max(original_size))
-    width = max(16, round(original_size[0] * scale / 16) * 16)
-    height = max(16, round(original_size[1] * scale / 16) * 16)
-    size = (width, height)
-    image = image.resize(size, Image.Resampling.LANCZOS)
-    mask_image = Image.fromarray(mask, "L").resize(size, Image.Resampling.NEAREST)
-    mask_tensor = torch.from_numpy(np.asarray(mask_image).copy()).float()[None, None] / 255.0
-    return image, mask_image, mask_tensor, original_size
+    return prepare_inputs(image, Image.fromarray(mask, "L"), max_side)
 
 
 def main():

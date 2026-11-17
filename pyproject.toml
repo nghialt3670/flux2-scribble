@@ -12,4 +12,5 @@ dependencies = [
     "pillow>=11",
     "numpy>=2.0",
     "matplotlib>=3.9",
+    "gradio>=6.0,<7",
 ]

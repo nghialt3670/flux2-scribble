@@ -18,7 +18,23 @@ uv sync
 
 If CUDA is available, run on a high-memory NVIDIA GPU. On an Apple M-series Mac the code can use `mps`, but gradient-based 4B inference can be memory-heavy and significantly slower than ordinary inference. A 48GB unified-memory Mac may still run out of memory.
 
-## Inputs
+## Draw your scribble in a browser (recommended)
+
+```bash
+uv sync
+uv run python ui.py --inbrowser
+```
+
+Open `http://127.0.0.1:7861` (if it does not open automatically).
+
+1. Upload or paste the original image into the canvas.
+2. Draw a **red** stroke over the image with the brush (erase/undo if needed).
+3. Enter a prompt such as `Insert a curved cat following the drawn line`, with `cat` as the object phrase.
+4. Click **Preview detected scribble** to check that it is being captured, then **Generate edited image**.
+
+The UI sends the *clean original background* as the reference image, and derives a separate grayscale scribble mask from the transparency of the drawing layer. The red annotation is **not** baked into the model's reference image. The model loads on the first generation. Results and diagnostics are saved under `outputs/ui_...`. The UI and CLI share the same latent-guidance pipeline.
+
+## Inputs (CLI alternative)
 
 - `input.png`: input/reference image
 - `scribble.png`: **same pixel dimensions**. White strokes on black background by default. For black-on-white strokes use `--polarity dark`. RGBA transparent overlay: `--polarity alpha`.
@@ -68,6 +84,8 @@ uv run python app.py --image input.png --scribble scribble.png \
 ## Structure
 
 - `app.py`: CLI, model loading, same-size input preprocessing, saves output
+- `ui.py`: Gradio draw-on-image interface; returns original background plus stroke-alpha mask
+- `input_utils.py`: shared resizing and input validation
 - `pipeline.py`: reference-conditioning, guidance, CFG, native Euler sampling and VAE decoding
 - `attention.py`: **differentiable** attention extraction using Q/K and RoPE forward pre-hooks (D and S blocks supported)
 - `guidance.py`: stroke distribution, cross-entropy loss, gradient normalization
