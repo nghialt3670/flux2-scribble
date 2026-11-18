@@ -115,3 +115,56 @@ For black-on-white scribbles, use `--polarity dark`. The CLI accepts a mask matc
 - `tests/`: CPU tests including rectangular maps, loss-score equivalence, head capture and gradient propagation.
 
 Validated without model weights: Python syntax checks, Gradio UI construction, and CPU tests. **Full FLUX.2 Klein checkpoint inference and resulting image quality have not been validated in this environment.** Current Diffusers Git HEAD may introduce API changes; pin a known-good revision once your run works.
+
+## Individual attention-head control (new)
+
+In Gradio, expand **Attention head configuration**. Three mutually exclusive modes:
+
+| Head mode | What enters the guidance loss |
+| --- | --- |
+| **Uniform** | The original equal-head / equal-block attention average (unchanged baseline). |
+| **Adaptive weighting** | All heads in `Attention blocks` with online before/after loss-improvement weights. |
+| **Individual heads** | **Only** the explicitly named heads, with fixed relative weights. Unlisted heads have zero weight. |
+
+In **Individual heads**, write for example:
+
+```text
+D2:H3,D2:H7=2,S4:H1=0.5
+```
+
+This selects head 3 in double-stream block 2 (weight 1), head 7 in D2 (weight 2), and head 1 in single-stream block 4 (weight 0.5). The program normalizes these values to sum to 1. It discovers the needed attention blocks from this list, ignoring the regular `Attention blocks` field. Head indices are zero-based. It rejects duplicate or out-of-range heads.
+
+**These weights apply to the attention maps used by the guidance loss; they do not modify the transformer weights or native attention operators.** The latent still receives the gradient of the selected, weighted attention map.
+
+**CLI example (manual):**
+
+```bash
+uv run python app.py \
+  --image input.png --scribble scribble.png \
+  --prompt "Insert a curved cat following the scribble" --object "cat" \
+  --attention-weighting manual \
+  --manual-heads "D2:H3,D2:H7=2,S4:H1=0.5" \
+  --out outputs_manual
+```
+
+### Head statistics and visualization (new)
+
+The UI defaults to **Save per-head statistics and heatmaps**. Disable it for faster runs. The CLI equivalent is on by default; `--no-head-statistics` disables it. `--head-vis-interval 3` exports maps on steps 0, 3, 6, ... **and the last guided step**. Use `--head-vis-interval 1` for every guided step.
+
+Under `outputs.../attention_heads/`:
+
+| File / folder | Purpose |
+| --- | --- |
+| `head_steps.csv` | Every captured head at **every guided timestep**: weight used, alignment loss, raw attention statistics, spatial entropy, scribble mass, peak token coordinates. Adaptive mode also includes same-step after-guidance loss and improvement. |
+| `head_summary.csv` | One row per head: mean weight, mean loss, mean stroke mass, mean entropy and (adaptive mode) improvement. |
+| `head_maps/step_XXX/<BLOCK>_HYY.png` | Separate attention-map overlay for **every** head in the selected blocks at each exported timestep. |
+| `contact_sheets/step_XXX_<BLOCK>.png` | Side-by-side images of every head in a block (also previewed in the UI). |
+| `head_trends/<BLOCK>_HYY.png` | Individual head chart: alignment loss and guidance weight over all guided steps. |
+| `raw_maps/step_XXX.npz` | Floating-point attention maps of every head at every guided step, plus names, weights and scribble grid for later analysis. |
+| `README.txt` | Definition of exported metrics and important interpretation notes. |
+
+For uniform mode the diagnostics include all heads in the selected blocks. For manual mode they also include **unused heads** from the named blocks, labeled `selected=0`, `weight_used=0`, to support comparisons. A map's colors are normalized **individually for display**, so brightness between images is not a direct comparison of attention magnitude; use CSV metrics for that.
+
+Exporting each head is more expensive than a single averaged attention map. These are **image-to-target-text probability maps**, not ground-truth object segmentations. A stronger head score or higher weight is **not proof of causal control** of object geometry.
+
+The previous propagation, loss toggles, and base/experimental inpaint modes are retained unchanged. Full checkpoint inference has not been tested in this creation environment.

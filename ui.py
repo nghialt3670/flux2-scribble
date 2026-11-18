@@ -82,6 +82,7 @@ def generate(
     cfg, blocks_string, seed, device, dtype, cpu_offload,
     mode, inpaint_strength,
     attention_weighting, head_score_metric, head_temperature, head_ema, head_uniform_mix,
+    manual_head_spec, save_head_statistics, head_visualization_interval,
     use_coverage, use_focal, use_moment, use_centerline,
     coverage_weight, focal_alpha, focal_beta, focal_weight,
     moment_alpha, moment_weight, centerline_weight,
@@ -97,7 +98,10 @@ def generate(
         if int(guide_steps) > int(steps):
             raise ValueError("Guided steps cannot exceed total steps")
         blocks = [s.strip().upper() for s in blocks_string.split(",") if s.strip()]
-        if not blocks or len(blocks) != len(set(blocks)):
+        if str(attention_weighting) == "manual":
+            from attention_weighting import parse_manual_heads
+            parse_manual_heads(str(manual_head_spec))
+        elif not blocks or len(blocks) != len(set(blocks)):
             raise ValueError("Choose unique blocks, e.g. D0,D1,D2,D3,D4")
         prop_blocks = [s.strip().upper() for s in prop_blocks_string.split(",") if s.strip()]
         if propagate and (not prop_blocks or len(prop_blocks) != len(set(prop_blocks))):
@@ -128,6 +132,9 @@ def generate(
             head_temperature=float(head_temperature),
             head_ema=float(head_ema),
             head_uniform_mix=float(head_uniform_mix),
+            manual_head_spec=str(manual_head_spec),
+            save_head_statistics=bool(save_head_statistics),
+            head_visualization_interval=int(head_visualization_interval),
             use_coverage=bool(use_coverage), use_focal=bool(use_focal), use_moment=bool(use_moment), use_centerline=bool(use_centerline),
             coverage_weight=float(coverage_weight),
             focal_alpha=float(focal_alpha), focal_beta=float(focal_beta), focal_weight=float(focal_weight),
@@ -158,6 +165,10 @@ def generate(
                 )
         else:
             lines.append("Guidance disabled")
+        if info["head_statistics_dir"]:
+            lines.append(f"Per-head stats / images: {info['head_statistics_dir']}")
+        if str(attention_weighting) == "manual":
+            lines.append(f"Manual head selection: {manual_head_spec}")
         if info["weight_history"]:
             most_recent = info["weight_history"][-1]
             top = most_recent["top_heads"][:3]
@@ -176,7 +187,10 @@ def generate(
         if bool(propagate):
             expansions = [e["propagation"]["added"] for e in info["log"] if e["propagation"]]
             lines.append(f"Propagation: {len(expansions)} iterations, {sum(expansions)} new grid cells")
-        return result, mask, propagated, str(destination / "summary.png"), "\n".join(lines)
+        return (
+            result, mask, propagated, str(destination / "summary.png"),
+            info["head_atlas"], "\n".join(lines),
+        )
     except (ValueError, RuntimeError) as exc:
         raise gr.Error(str(exc)) from exc
 
@@ -208,38 +222,69 @@ def build_ui() -> gr.Blocks:
                     guide_steps = gr.Slider(minimum=0, maximum=30, value=10, step=1, label="Early steps with guidance", info="How many early denoising steps receive scribble guidance.")
                     strength = gr.Slider(minimum=0.0, maximum=0.1, value=0.01, step=0.001, label="Latent guidance strength", info="Step size for the latent update from the guidance gradient.")
                     cfg = gr.Slider(minimum=1, maximum=8, value=4, step=0.5, label="CFG scale", info="Classifier-free guidance scale for prompt adherence.")
-                    blocks = gr.Textbox(label="Attention blocks", value="D0,D1,D2,D3,D4", info="Blocks used to collect image-to-text attention for the guidance loss.")
                     seed = gr.Number(label="Random seed", value=42, precision=0, info="Use the same seed to compare settings.")
                     with gr.Row():
                         device = gr.Dropdown(["auto", "cuda", "mps", "cpu"], value="auto", label="Device", info="Where to run the model.")
                         dtype = gr.Dropdown(["auto", "bf16", "fp32"], value="auto", label="Model dtype", info="bf16 is faster/lighter on supported GPUs. fp32 is more stable but heavier.")
                     cpu_offload = gr.Checkbox(value=False, label="CPU offload (CUDA only)", info="Moves parts of the model between CPU and GPU to save VRAM.")
-                with gr.Accordion("Attention head weighting", open=False):
+                with gr.Accordion("Attention head configuration", open=True):
                     gr.Markdown(
-                        "**Uniform** reproduces the old mean across attention heads. "
-                        "**Adaptive** favors heads whose scribble alignment improves after the "
-                        "current latent update. Weights apply on the **next** guided step. "
-                        "This measures responsiveness, not causal influence on object geometry."
+                        "**Uniform:** original equal-head baseline. **Adaptive:** update per-head weights "
+                        "from same-timestep loss improvement. **Manual:** guide using only explicitly "
+                        "selected heads (optional relative weights). No model parameters are changed."
                     )
-                    attention_weighting = gr.Dropdown(
-                        ["uniform", "adaptive"], value="uniform", label="Head weighting mode",
-                        info="Uniform = old baseline. Adaptive = learn per-head weights from same-timestep before/after attention loss."
+                    attention_weighting = gr.Radio(
+                        choices=[("Uniform", "uniform"), ("Adaptive weighting", "adaptive"),
+                                 ("Individual heads", "manual")],
+                        value="uniform", label="Head mode",
+                        info="Switch between all-head average, online adaptive weights, and an explicit head list."
                     )
-                    head_score_metric = gr.Dropdown(
-                        ["selected", "coverage"], value="selected", label="Per-head improvement metric",
-                        info="Selected = use your enabled loss combination. Coverage = use the old coverage loss only to evaluate heads, regardless of guidance losses."
+                    blocks = gr.Textbox(
+                        label="Attention blocks for uniform/adaptive", value="D0,D1,D2,D3,D4",
+                        info="Comma-separated transformer blocks. D = double-stream, S = single-stream. "
+                             "Ignored in Individual heads mode, which infers blocks from the head list."
                     )
-                    head_temperature = gr.Number(
-                        value=0.01, label="Softmax temperature (tau)",
-                        info="Smaller values focus on heads with larger loss reductions; larger values give more equal weights. Must be > 0."
+                    with gr.Group(visible=False) as manual_group:
+                        manual_head_spec = gr.Textbox(
+                            label="Individual heads (block:head[=weight])", value="D2:H3,D2:H7",
+                            lines=2, info="Examples: D2:H3, D2:H7=2, S4:H1=0.5. "
+                                         "Unlisted heads have zero guidance weight; weights are normalized. "
+                                         "Only the named blocks are captured."
+                        )
+                    with gr.Group(visible=False) as adaptive_group:
+                        head_score_metric = gr.Dropdown(
+                            ["selected", "coverage"], value="selected", label="Per-head improvement metric",
+                            info="Selected = enabled guidance losses; coverage = old coverage loss only."
+                        )
+                        with gr.Row():
+                            head_temperature = gr.Number(
+                                value=0.01, label="Softmax temperature (tau)",
+                                info="Lower favors heads with larger loss improvement. Must be positive."
+                            )
+                            head_ema = gr.Slider(
+                                minimum=0.05, maximum=1.0, step=0.05, value=0.5,
+                                label="EMA update rate", info="Higher adapts faster; lower keeps previous weights."
+                            )
+                            head_uniform_mix = gr.Slider(
+                                minimum=0, maximum=1, step=0.05, value=0.1,
+                                label="Uniform mixing", info="Keeps some weight on all heads (0–1)."
+                            )
+                    gr.Markdown("**Per-head diagnostics** — records all heads in the chosen blocks, "
+                                "even those excluded in manual mode. Heatmaps use separate contrast scales.")
+                    save_head_statistics = gr.Checkbox(
+                        value=True, label="Save per-head statistics and heatmaps",
+                        info="Save a per-head CSV at every guided step; export PNG overlays and contact sheets periodically."
                     )
-                    head_ema = gr.Slider(
-                        minimum=0.05, maximum=1.0, step=0.05, value=0.5, label="Weight update rate (EMA)",
-                        info="1 = use most recent improvement scores; smaller values keep more of the previous weights."
+                    head_visualization_interval = gr.Slider(
+                        minimum=1, maximum=30, step=1, value=3,
+                        label="Heatmap export interval (guided steps)",
+                        info="Save PNG for every head at steps 0, N, 2N… and the last guided step. "
+                             "Smaller intervals produce more files and disk writes."
                     )
-                    head_uniform_mix = gr.Slider(
-                        minimum=0, maximum=1, step=0.05, value=0.1, label="Minimum uniform mixing",
-                        info="Keeps some weight on every head to reduce early collapse. 0 = only improvement-based weights; 1 = always uniform."
+                    attention_weighting.change(
+                        lambda choice: (gr.update(visible=choice == "manual"),
+                                        gr.update(visible=choice == "adaptive")),
+                        inputs=[attention_weighting], outputs=[manual_group, adaptive_group],
                     )
                 with gr.Accordion("Loss settings", open=False):
                     use_coverage = gr.Checkbox(value=False, label="Use old coverage loss", info="The original simple loss: make attention cover the scribble region.")
@@ -271,7 +316,8 @@ def build_ui() -> gr.Blocks:
                 mask_preview = gr.Image(label="Original scribble mask", type="pil", image_mode="L")
                 prop_preview = gr.Image(label="Propagated scribble mask", type="pil", image_mode="L")
                 summary = gr.Image(label="Attention and result summary")
-                status = gr.Textbox(label="Run details", interactive=False, lines=5)
+                head_atlas = gr.Image(label="Per-head attention contact sheet (last exported block)")
+                status = gr.Textbox(label="Run details", interactive=False, lines=7)
 
         check.click(preview_stroke, inputs=[editor], outputs=[mask_preview])
 
@@ -289,13 +335,14 @@ def build_ui() -> gr.Blocks:
                 cfg, blocks, seed, device, dtype, cpu_offload,
                 mode, inpaint_strength,
                 attention_weighting, head_score_metric, head_temperature, head_ema, head_uniform_mix,
+                manual_head_spec, save_head_statistics, head_visualization_interval,
                 use_coverage, use_focal, use_moment, use_centerline,
                 coverage_weight, focal_alpha, focal_beta, focal_weight,
                 moment_alpha, moment_weight, centerline_weight,
                 propagate, prop_start, prop_end, prop_blocks, prop_top_k,
                 prop_threshold, prop_max_area,
             ],
-            outputs=[output, mask_preview, prop_preview, summary, status],
+            outputs=[output, mask_preview, prop_preview, summary, head_atlas, status],
             concurrency_limit=1,
         )
     return demo
@@ -307,7 +354,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--inbrowser", action="store_true")
     args = parser.parse_args()
-    build_ui().queue().launch(server_name=args.host, server_port=args.port, inbrowser=args.inbrowser, share=True)
+    build_ui().queue().launch(server_name=args.host, server_port=args.port, inbrowser=args.inbrowser)
 
 
 if __name__ == "__main__":

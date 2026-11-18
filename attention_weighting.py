@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import re
 
 import torch
 import torch.nn.functional as F
@@ -197,3 +198,53 @@ class OnlineHeadWeighter:
             "top_heads": top,
             "effective_heads": float(entropy.exp().item()),
         }
+
+
+# Explicit head control; labels match AttentionCollector.head_labels().
+# Example: "D2:H3,D2:H7=2,S4:H1=0.5". Unlisted heads get zero weight.
+_HEAD_PATTERN = re.compile(r"([DS])(\d+):H(\d+)(?:\s*=\s*([0-9.+eE-]+))?", re.I)
+
+
+def parse_manual_heads(spec: str) -> dict[str, float]:
+    """Parse comma/semicolon/newline-delimited block:head[=relative_weight] entries."""
+    result: dict[str, float] = {}
+    for raw in re.split(r"[,;\n]+", spec.strip()):
+        token = raw.strip()
+        if not token:
+            continue
+        match = _HEAD_PATTERN.fullmatch(token)
+        if match is None:
+            raise ValueError(f"Invalid head {token!r}; use e.g. D2:H3,D2:H7=2,S4:H1")
+        kind, block, head, weight_str = match.groups()
+        label = f"{kind.upper()}{int(block)}:H{int(head):02d}"
+        weight = 1.0 if weight_str is None else float(weight_str)
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError(f"Head {label} must have a finite positive weight")
+        if label in result:
+            raise ValueError(f"Duplicate manual head {label}")
+        result[label] = weight
+    if not result:
+        raise ValueError("Select at least one manual head, e.g. D2:H3,D2:H7")
+    return result
+
+
+def manual_blocks(spec: str) -> list[str]:
+    """Find transformer blocks used in the manual specification, preserving order."""
+    return list(dict.fromkeys(label.split(":")[0] for label in parse_manual_heads(spec)))
+
+
+def manual_weights(labels: list[str], spec: str, device: torch.device | str) -> torch.Tensor:
+    """Normalized nonnegative weights over all heads captured in these blocks."""
+    desired = parse_manual_heads(spec)
+    missing = set(desired) - set(labels)
+    if missing:
+        raise ValueError(f"Head indices unavailable in this model: {', '.join(sorted(missing))}")
+    weights = torch.tensor([desired.get(label, 0.0) for label in labels], dtype=torch.float32, device=device)
+    return weights / weights.sum()
+
+
+def aggregate_head_maps(head_maps: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Return [B,spatial_tokens] with gradient retained through the head maps."""
+    if head_maps.ndim != 3 or weights.ndim != 1 or head_maps.shape[1] != weights.numel():
+        raise ValueError("Expected head maps [B,H,N] and weights [H]")
+    return (head_maps * weights.to(head_maps.device, head_maps.dtype)[None, :, None]).sum(dim=1)

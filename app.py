@@ -71,7 +71,10 @@ def main():
     parser.add_argument("--query-chunk", type=int, default=64)
     parser.add_argument("--cpu-offload", action="store_true", help="Enable model CPU offload (mostly CUDA)")
     parser.add_argument("--mode", choices=["base", "inpaint"], default="base")
-    parser.add_argument("--attention-weighting", choices=["uniform", "adaptive"], default="uniform", help="Uniform mean (baseline) or adaptive per-head weighting")
+    parser.add_argument("--attention-weighting", choices=["uniform", "adaptive", "manual"], default="uniform", help="Head mode: uniform, adaptive weighting, or manual head selection")
+    parser.add_argument("--manual-heads", default="D2:H3,D2:H7", help="Manual mode: e.g. D2:H3,D2:H7=2,S4:H1=0.5")
+    parser.add_argument("--no-head-statistics", action="store_true", help="Disable per-head CSV and heatmaps (saves time and memory)")
+    parser.add_argument("--head-vis-interval", type=int, default=3, help="Save individual head heatmaps every N guided steps (plus last step)")
     parser.add_argument("--head-score-metric", choices=["selected", "coverage"], default="selected", help="Per-head improvement metric: enabled guidance losses or coverage only")
     parser.add_argument("--head-temperature", type=float, default=0.01, help="Softmax temperature for per-head loss improvements")
     parser.add_argument("--head-ema", type=float, default=0.5, help="Blend fraction for the new head weights (0 < EMA <= 1)")
@@ -107,7 +110,10 @@ def main():
     )
     image, mask, mask_tensor, original_size = load_inputs(args.image, args.scribble, args.max_side, args.polarity)
     blocks = [part.strip().upper() for part in args.blocks.split(",") if part.strip()]
-    if len(blocks) != len(set(blocks)):
+    if args.attention_weighting == "manual":
+        from attention_weighting import parse_manual_heads
+        parse_manual_heads(args.manual_heads)
+    elif len(blocks) != len(set(blocks)):
         parser.error("--blocks must not contain duplicates")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -132,6 +138,9 @@ def main():
         head_temperature=args.head_temperature,
         head_ema=args.head_ema,
         head_uniform_mix=args.head_uniform_mix,
+        manual_head_spec=args.manual_heads,
+        save_head_statistics=not args.no_head_statistics,
+        head_visualization_interval=args.head_vis_interval,
         use_coverage=args.use_coverage,
         use_focal=not args.no_focal, use_moment=not args.no_moment, use_centerline=not args.no_centerline,
         coverage_weight=args.coverage_weight,
