@@ -76,3 +76,25 @@ def test_joint_attention_maps_are_differentiable_and_split_image_only():
     assert (obj.sum()).backward() is None
     assert x.grad is not None and x.grad.abs().sum() > 0
     assert not self_map.requires_grad
+
+
+def test_per_head_maps_match_legacy_mean_and_backpropagate():
+    torch.manual_seed(17)
+    transformer = FakeTransformer()
+    x = torch.randn(1, 6, 8, requires_grad=True)
+    enc = torch.randn(1, 3, 8)
+    extractor = AttentionCollector(
+        transformer, [1], 4, ['D0'], self_blocks=['D0'], query_chunk=2,
+        capture_heads=True,
+    )
+    with extractor.capture(text_len=3, capture_self=True):
+        transformer.transformer_blocks[0].attn(
+            hidden_states=x, encoder_hidden_states=enc, image_rotary_emb=None
+        )
+    heads = extractor.heads_tensor()
+    mean = extractor.mean_map()
+    assert heads.shape == (1, 2, 4)
+    assert extractor.head_labels() == ['D0:H00', 'D0:H01']
+    assert torch.allclose(heads.mean(dim=1), mean, atol=1e-7)
+    mean.sum().backward()
+    assert x.grad is not None and x.grad.abs().sum() > 0

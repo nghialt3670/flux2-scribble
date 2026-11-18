@@ -71,6 +71,11 @@ def main():
     parser.add_argument("--query-chunk", type=int, default=64)
     parser.add_argument("--cpu-offload", action="store_true", help="Enable model CPU offload (mostly CUDA)")
     parser.add_argument("--mode", choices=["base", "inpaint"], default="base")
+    parser.add_argument("--attention-weighting", choices=["uniform", "adaptive"], default="uniform", help="Uniform mean (baseline) or adaptive per-head weighting")
+    parser.add_argument("--head-score-metric", choices=["selected", "coverage"], default="selected", help="Per-head improvement metric: enabled guidance losses or coverage only")
+    parser.add_argument("--head-temperature", type=float, default=0.01, help="Softmax temperature for per-head loss improvements")
+    parser.add_argument("--head-ema", type=float, default=0.5, help="Blend fraction for the new head weights (0 < EMA <= 1)")
+    parser.add_argument("--head-uniform-mix", type=float, default=0.1, help="Fraction of uniform weights mixed into each update [0,1]")
     parser.add_argument("--inpaint-strength", type=float, default=0.8)
     parser.add_argument("--use-coverage", action="store_true")
     parser.add_argument("--no-focal", action="store_true")
@@ -122,6 +127,11 @@ def main():
         prop_top_k=args.prop_top_k, prop_threshold=args.prop_threshold,
         prop_max_area=args.prop_max_area,
         edit_mode=args.mode, inpaint_strength=args.inpaint_strength,
+        attention_weighting=args.attention_weighting,
+        head_score_metric=args.head_score_metric,
+        head_temperature=args.head_temperature,
+        head_ema=args.head_ema,
+        head_uniform_mix=args.head_uniform_mix,
         use_coverage=args.use_coverage,
         use_focal=not args.no_focal, use_moment=not args.no_moment, use_centerline=not args.no_centerline,
         coverage_weight=args.coverage_weight,

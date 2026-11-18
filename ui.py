@@ -81,6 +81,7 @@ def generate(
     editor, prompt, object_phrase, max_side, steps, guide_steps, strength,
     cfg, blocks_string, seed, device, dtype, cpu_offload,
     mode, inpaint_strength,
+    attention_weighting, head_score_metric, head_temperature, head_ema, head_uniform_mix,
     use_coverage, use_focal, use_moment, use_centerline,
     coverage_weight, focal_alpha, focal_beta, focal_weight,
     moment_alpha, moment_weight, centerline_weight,
@@ -122,6 +123,11 @@ def generate(
             prop_blocks=prop_blocks, prop_top_k=int(prop_top_k),
             prop_threshold=float(prop_threshold), prop_max_area=float(prop_max_area),
             edit_mode=str(mode), inpaint_strength=float(inpaint_strength),
+            attention_weighting=str(attention_weighting),
+            head_score_metric=str(head_score_metric),
+            head_temperature=float(head_temperature),
+            head_ema=float(head_ema),
+            head_uniform_mix=float(head_uniform_mix),
             use_coverage=bool(use_coverage), use_focal=bool(use_focal), use_moment=bool(use_moment), use_centerline=bool(use_centerline),
             coverage_weight=float(coverage_weight),
             focal_alpha=float(focal_alpha), focal_beta=float(focal_beta), focal_weight=float(focal_weight),
@@ -152,6 +158,15 @@ def generate(
                 )
         else:
             lines.append("Guidance disabled")
+        if info["weight_history"]:
+            most_recent = info["weight_history"][-1]
+            top = most_recent["top_heads"][:3]
+            lines.append(
+                "Adaptive heads (top 3): " + ", ".join(
+                    f"{h['head']}={h['weight']:.3f}" for h in top
+                )
+            )
+            lines.append(f"Effective head count: {most_recent['effective_heads']:.1f}")
 
         propagated = (
             Image.open(destination / "scribble_propagated.png").copy()
@@ -199,6 +214,33 @@ def build_ui() -> gr.Blocks:
                         device = gr.Dropdown(["auto", "cuda", "mps", "cpu"], value="auto", label="Device", info="Where to run the model.")
                         dtype = gr.Dropdown(["auto", "bf16", "fp32"], value="auto", label="Model dtype", info="bf16 is faster/lighter on supported GPUs. fp32 is more stable but heavier.")
                     cpu_offload = gr.Checkbox(value=False, label="CPU offload (CUDA only)", info="Moves parts of the model between CPU and GPU to save VRAM.")
+                with gr.Accordion("Attention head weighting", open=False):
+                    gr.Markdown(
+                        "**Uniform** reproduces the old mean across attention heads. "
+                        "**Adaptive** favors heads whose scribble alignment improves after the "
+                        "current latent update. Weights apply on the **next** guided step. "
+                        "This measures responsiveness, not causal influence on object geometry."
+                    )
+                    attention_weighting = gr.Dropdown(
+                        ["uniform", "adaptive"], value="uniform", label="Head weighting mode",
+                        info="Uniform = old baseline. Adaptive = learn per-head weights from same-timestep before/after attention loss."
+                    )
+                    head_score_metric = gr.Dropdown(
+                        ["selected", "coverage"], value="selected", label="Per-head improvement metric",
+                        info="Selected = use your enabled loss combination. Coverage = use the old coverage loss only to evaluate heads, regardless of guidance losses."
+                    )
+                    head_temperature = gr.Number(
+                        value=0.01, label="Softmax temperature (tau)",
+                        info="Smaller values focus on heads with larger loss reductions; larger values give more equal weights. Must be > 0."
+                    )
+                    head_ema = gr.Slider(
+                        minimum=0.05, maximum=1.0, step=0.05, value=0.5, label="Weight update rate (EMA)",
+                        info="1 = use most recent improvement scores; smaller values keep more of the previous weights."
+                    )
+                    head_uniform_mix = gr.Slider(
+                        minimum=0, maximum=1, step=0.05, value=0.1, label="Minimum uniform mixing",
+                        info="Keeps some weight on every head to reduce early collapse. 0 = only improvement-based weights; 1 = always uniform."
+                    )
                 with gr.Accordion("Loss settings", open=False):
                     use_coverage = gr.Checkbox(value=False, label="Use old coverage loss", info="The original simple loss: make attention cover the scribble region.")
                     use_focal = gr.Checkbox(value=True, label="Use ScribbleDiff focal loss", info="Pixel-wise focal objective on attention vs. the scribble mask.")
@@ -246,6 +288,7 @@ def build_ui() -> gr.Blocks:
                 editor, prompt, object_phrase, max_side, steps, guide_steps, strength,
                 cfg, blocks, seed, device, dtype, cpu_offload,
                 mode, inpaint_strength,
+                attention_weighting, head_score_metric, head_temperature, head_ema, head_uniform_mix,
                 use_coverage, use_focal, use_moment, use_centerline,
                 coverage_weight, focal_alpha, focal_beta, focal_weight,
                 moment_alpha, moment_weight, centerline_weight,
