@@ -68,7 +68,7 @@ def _load_model(mode: str, device_selection: str, dtype_name: str, cpu_offload: 
     print(f"Loading {MODEL} in {mode} mode on {device}, dtype={dtype}", flush=True)
     pipe = pipe_cls.from_pretrained(MODEL, torch_dtype=dtype)
     if cpu_offload:
-        if device != "cuda":
+        if not device.startswith("cuda"):
             raise ValueError("CPU offload is supported here only with the CUDA backend")
         pipe.enable_model_cpu_offload(device=device)
     else:
@@ -196,7 +196,7 @@ def build_ui() -> gr.Blocks:
                     blocks = gr.Textbox(label="Attention blocks", value="D0,D1,D2,D3,D4", info="Blocks used to collect image-to-text attention for the guidance loss.")
                     seed = gr.Number(label="Random seed", value=42, precision=0, info="Use the same seed to compare settings.")
                     with gr.Row():
-                        device = gr.Dropdown(["auto", "cuda", "mps", "cpu"], value="auto", label="Device", info="Where to run the model.")
+                        device = gr.Dropdown(["auto", "cuda", "cuda:1", "mps", "cpu"], value="cuda:1", label="Device", info="Where to run the model.")
                         dtype = gr.Dropdown(["auto", "bf16", "fp32"], value="auto", label="Model dtype", info="bf16 is faster/lighter on supported GPUs. fp32 is more stable but heavier.")
                     cpu_offload = gr.Checkbox(value=False, label="CPU offload (CUDA only)", info="Moves parts of the model between CPU and GPU to save VRAM.")
                 with gr.Accordion("Loss settings", open=False):

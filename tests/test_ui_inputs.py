@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 from PIL import Image, ImageDraw
 
-from ui import editor_to_images
+from ui import _device_and_dtype, editor_to_images
 from input_utils import prepare_inputs
 
 
@@ -45,6 +45,12 @@ class DrawingInputsTest(unittest.TestCase):
         self.editor["layers"] = []
         with self.assertRaisesRegex(ValueError, "Draw a red scribble"):
             editor_to_images(self.editor)
+
+
+class DeviceSelectionTest(unittest.TestCase):
+    def test_indexed_cuda_device_is_preserved(self):
+        device, _ = _device_and_dtype("cuda:1", "auto")
+        self.assertEqual(device, "cuda:1")
 
 
 if __name__ == "__main__":

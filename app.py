@@ -64,7 +64,7 @@ def main():
     parser.add_argument("--cfg", type=float, default=4.0)
     parser.add_argument("--blocks", default="D0,D1,D2,D3,D4", help="Comma-separated D0..D4 and/or S0..S19")
     parser.add_argument("--polarity", choices=["light", "dark", "alpha"], default="light")
-    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cuda", "cuda:1", "mps", "cpu"], default="cuda:1")
     parser.add_argument("--dtype", choices=["auto", "bf16", "fp32"], default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-text-tokens", type=int, default=256)
