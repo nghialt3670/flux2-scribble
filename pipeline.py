@@ -19,6 +19,11 @@ from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu,
 from diffusers.utils.torch_utils import get_module_execution_device
 
 from attention import AttentionCollector, find_object_token_indices
+from attention_weighting import (
+    HeadScoreConfig, OnlineHeadWeighter, score_head_maps, parse_manual_heads,
+    manual_blocks, manual_weights, aggregate_head_maps,
+)
+from head_diagnostics import HeadDiagnostics
 from guidance import compute_total_guidance_loss, normalized_latent_update, scribble_target
 from propagation import ScribblePropagator
 
@@ -103,6 +108,14 @@ def generate_guided(
     smooth_attn: bool = True,
     smooth_sigma: float = 0.5,
     smooth_kernel_size: int = 3,
+    attention_weighting: str = "uniform",
+    head_score_metric: str = "selected",
+    head_temperature: float = 0.01,
+    head_ema: float = 0.5,
+    head_uniform_mix: float = 0.1,
+    manual_head_spec: str = "D2:H3,D2:H7",
+    save_head_statistics: bool = True,
+    head_visualization_interval: int = 3,
 ):
     if num_steps < 1 or guide_steps < 0 or guide_steps > num_steps:
         raise ValueError("Require steps >= 1 and 0 <= guide_steps <= steps")
@@ -116,6 +129,25 @@ def generate_guided(
         raise ValueError("inpaint_strength must be in (0, 1]")
     if not 0 <= prop_start <= prop_end:
         raise ValueError("Require 0 <= prop_start <= prop_end (end is exclusive)")
+    if attention_weighting not in {"uniform", "adaptive", "manual"}:
+        raise ValueError("Attention head mode must be uniform, adaptive, or manual")
+    if head_visualization_interval < 1:
+        raise ValueError("Head visualization interval must be >= 1")
+    manual = attention_weighting == "manual"
+    if manual:
+        # Explicit head names override the block list. All heads in those blocks
+        # remain visible in diagnostics, but only named heads affect guidance.
+        parse_manual_heads(manual_head_spec)
+        blocks = manual_blocks(manual_head_spec)
+    if head_score_metric not in {"coverage", "selected"}:
+        raise ValueError("Head score metric must be coverage or selected")
+    if guide_steps > 0 and guidance_strength > 0 and not any([
+        use_coverage and coverage_weight != 0,
+        use_focal and focal_weight != 0,
+        use_moment and moment_weight != 0,
+        use_centerline and centerline_weight != 0,
+    ]):
+        raise ValueError("Enable at least one guidance loss with nonzero weight")
     if prop_blocks is None:
         prop_blocks = ["D2", "D3"]
     propagation_enabled = bool(propagate and guidance_strength > 0 and guide_steps > 0)
@@ -238,24 +270,86 @@ def generate_guided(
         )
         if propagation_enabled else None
     )
+    guided_enabled = guide_steps > 0 and guidance_strength > 0
+    adaptive = attention_weighting == "adaptive" and guided_enabled
+    manual = manual and guided_enabled
+    capture_heads = guided_enabled and (adaptive or manual or save_head_statistics and debug_dir is not None)
     collector = AttentionCollector(
         pipe.transformer, token_ids, latents.shape[1], blocks,
         query_chunk=attention_query_chunk,
         self_blocks=prop_blocks if propagation_enabled else [],
+        capture_heads=capture_heads,
+    )
+    weighter = (
+        OnlineHeadWeighter(
+            temperature=head_temperature, ema=head_ema,
+            uniform_mix=head_uniform_mix,
+        ) if adaptive else None
+    )
+    score_config = HeadScoreConfig(
+        metric=head_score_metric,
+        use_coverage=use_coverage,
+        use_focal=use_focal,
+        use_moment=use_moment,
+        use_centerline=use_centerline,
+        coverage_weight=coverage_weight,
+        focal_alpha=focal_alpha,
+        focal_beta=focal_beta,
+        focal_weight=focal_weight,
+        moment_alpha=moment_alpha,
+        moment_weight=moment_weight,
+        centerline_weight=centerline_weight,
+        smooth_attn=smooth_attn,
+        smooth_sigma=smooth_sigma,
+        smooth_kernel_size=smooth_kernel_size,
     )
 
+    diagnostics = (HeadDiagnostics(
+        debug_dir, image, grid_h, grid_w,
+        interval=head_visualization_interval, score_config=score_config,
+    ) if capture_heads and save_head_statistics and debug_dir is not None else None)
+    manual_w = None
     saved_attention = None
     log = []
     prop_history = []
+    weight_history = []
 
     for i, t in enumerate(timesteps):
+        head_before_losses = None
+        head_weight_event = None
         if i < guide_steps and guidance_strength > 0:
             do_propagate = bool(propagator is not None and prop_start <= i < min(prop_end, guide_steps))
             with torch.enable_grad():
                 x = latents.detach().float().requires_grad_(True)
                 with collector.capture(text_len=prompt_embeds.shape[1], capture_self=do_propagate):
                     _ = _forward(pipe, x, t, prompt_embeds, text_ids, latent_ids, ref_latents, ref_ids, "cond")
-                attention = collector.mean_map()
+                if capture_heads:
+                    head_maps = collector.heads_tensor()  # [B,heads,H*W]
+                    head_labels = collector.head_labels()
+                    if weighter is not None:
+                        weighter.initialize(head_labels, head_maps.device)
+                        active_weights = weighter.weights.detach().clone()
+                        attention = weighter.aggregate(head_maps)
+                    elif manual:
+                        if manual_w is None:
+                            manual_w = manual_weights(head_labels, manual_head_spec, head_maps.device)
+                            print("Manual heads: " + ", ".join(
+                                f"{label}={float(manual_w[j]):.4f}" for j, label in enumerate(head_labels)
+                                if manual_w[j].item() > 0
+                            ), flush=True)
+                        active_weights = manual_w
+                        attention = aggregate_head_maps(head_maps, active_weights)
+                    else:
+                        # Exact original equal-BLOCK mean, even with head stats enabled.
+                        attention = collector.mean_map()
+                        from collections import Counter
+                        counts = Counter(label.split(":")[0] for label in head_labels)
+                        active_weights = torch.tensor(
+                            [1.0 / (len(blocks) * counts[label.split(":")[0]]) for label in head_labels],
+                            device=head_maps.device, dtype=torch.float32,
+                        )
+                else:
+                    attention = collector.mean_map()
                 prop_event = None
                 if do_propagate:
                     prop_event = propagator.propagate(collector.mean_self_map())
@@ -267,6 +361,22 @@ def generate_guided(
                         **prop_event,
                         "mask": propagator.active[0].detach().cpu().clone(),
                     })
+                if capture_heads:
+                    if weighter is not None:
+                        # Same target/loss parameters used for BEFORE/AFTER at same t.
+                        head_before_losses = score_head_maps(
+                            head_maps.detach(), target, grid_h, grid_w, score_config
+                        )
+                        weights_used = active_weights.cpu().tolist()
+                    if diagnostics is not None:
+                        diagnostics.record(
+                            step=i, timestep=float(t.item()), labels=head_labels,
+                            maps=head_maps.detach(), target=target,
+                            weights=active_weights,
+                            before_scores=head_before_losses,
+                            is_last_guided=(i == min(guide_steps, len(timesteps)) - 1),
+                        )
+                    del head_maps
                 loss, components, attn_map = compute_total_guidance_loss(
                     attention,
                     target,
@@ -296,13 +406,39 @@ def generate_guided(
                 component_values = {k: float(v.item()) for k, v in components.items()}
                 del x, attention, loss, grad, x_new, attn_map
                 collector.maps.clear()
+                collector.head_maps.clear()
                 collector.self_maps.clear()
         else:
             loss_value, grad_rms, prop_event = None, None, None
             component_values = None
 
         with torch.no_grad():
-            prediction = _forward(pipe, latents, t, prompt_embeds, text_ids, latent_ids, ref_latents, ref_ids, "cond")
+            if head_before_losses is not None:
+                # Capture post-update head maps from the CONDITIONAL forward
+                # already needed to obtain the Klein denoising velocity.
+                # Crucially, this is still the SAME t as the before maps.
+                with collector.capture(text_len=prompt_embeds.shape[1], capture_self=False):
+                    prediction = _forward(
+                        pipe, latents, t, prompt_embeds, text_ids,
+                        latent_ids, ref_latents, ref_ids, "cond"
+                    )
+                after_losses = score_head_maps(
+                    collector.heads_tensor().detach(), target,
+                    grid_h, grid_w, score_config,
+                )
+                head_weight_event = weighter.update(head_before_losses, after_losses, step=i)
+                if diagnostics is not None:
+                    diagnostics.record_after(i, after_losses)
+                head_weight_event["weights_used"] = weights_used
+                weight_history.append(head_weight_event)
+                collector.maps.clear()
+                collector.head_maps.clear()
+                collector.self_maps.clear()
+            else:
+                prediction = _forward(
+                    pipe, latents, t, prompt_embeds, text_ids,
+                    latent_ids, ref_latents, ref_ids, "cond"
+                )
             if cfg_scale > 1:
                 negative_prediction = _forward(
                     pipe, latents, t, negative_embeds, negative_ids,
@@ -329,6 +465,10 @@ def generate_guided(
             "components": component_values,
             "grad_rms": grad_rms,
             "propagation": prop_event,
+            "head_weighting": {
+                "effective_heads": head_weight_event["effective_heads"],
+                "top_heads": head_weight_event["top_heads"],
+            } if head_weight_event is not None else None,
         })
         if component_values is not None:
             print(
@@ -362,6 +502,17 @@ def generate_guided(
         dest = Path(debug_dir)
         dest.mkdir(parents=True, exist_ok=True)
         (dest / "guidance_log.json").write_text(json.dumps(log, indent=2))
+        if adaptive:
+            (dest / "attention_weight_history.json").write_text(
+                json.dumps({
+                    "mode": attention_weighting,
+                    "score_metric": head_score_metric,
+                    "temperature": head_temperature,
+                    "ema": head_ema,
+                    "uniform_mix": head_uniform_mix,
+                    "history": weight_history,
+                }, indent=2)
+            )
         if saved_attention is not None:
             np.save(dest / "attention_last_guided.npy", saved_attention.numpy())
         if propagator is not None:
@@ -376,6 +527,9 @@ def generate_guided(
                 mask = F.interpolate(item["mask"][None, None].float(), size=(height, width), mode="nearest")[0, 0].numpy()
                 Image.fromarray((mask * 255).astype(np.uint8), "L").save(mask_dest / f"step_{item['step']:03d}.png")
 
+    if diagnostics is not None:
+        diagnostics.finalize()
+
     final_grid = (propagator.active[0].detach().cpu().clone() if propagator is not None
                   else (target[0].reshape(grid_h, grid_w) > 0).detach().cpu())
     return output, {
@@ -384,4 +538,8 @@ def generate_guided(
         "target_grid": target.detach().cpu(),
         "propagated_mask": final_grid,
         "edit_mode": edit_mode,
+        "attention_weighting": attention_weighting,
+        "weight_history": weight_history,
+        "head_atlas": str(diagnostics.last_atlas) if diagnostics is not None and diagnostics.last_atlas is not None else None,
+        "head_statistics_dir": str(diagnostics.root) if diagnostics is not None else None,
     }

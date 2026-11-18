@@ -25,6 +25,7 @@ class AttentionCollector:
         blocks: list[str],
         query_chunk: int = 64,
         self_blocks: list[str] | None = None,
+        capture_heads: bool = False,
     ):
         self.transformer = transformer
         self.tokens = target_text_tokens
@@ -32,7 +33,9 @@ class AttentionCollector:
         self.blocks = blocks
         self.self_blocks = self_blocks or []
         self.query_chunk = query_chunk
+        self.capture_heads = capture_heads
         self.maps: dict[str, torch.Tensor] = {}
+        self.head_maps: dict[str, torch.Tensor] = {}
         self.self_maps: dict[str, torch.Tensor] = {}
         if not self.tokens:
             raise ValueError("Target object text token selection is empty")
@@ -101,8 +104,16 @@ class AttentionCollector:
                 logits = (q_cross[:, :, pos : pos + self.query_chunk] @ k_all.transpose(-1, -2)) / math.sqrt(head_dim)
                 numer = logits.index_select(-1, inds).logsumexp(dim=-1)
                 denom = logits.logsumexp(dim=-1)
-                chunks.append(torch.exp(numer - denom).mean(dim=1))
-            self.maps[name] = torch.cat(chunks, dim=1)
+                # Retain [B,head,spatial_query] only in adaptive mode.
+                # The ordinary, low-memory path still averages over heads.
+                probabilities = torch.exp(numer - denom)
+                chunks.append(probabilities if self.capture_heads else probabilities.mean(dim=1))
+            if self.capture_heads:
+                per_head = torch.cat(chunks, dim=2)
+                self.head_maps[name] = per_head
+                self.maps[name] = per_head.mean(dim=1)
+            else:
+                self.maps[name] = torch.cat(chunks, dim=1)
 
         if name in self._active_self_blocks:
             # Klein has joint attention, unlike the U-Net's separate spatial
@@ -128,6 +139,7 @@ class AttentionCollector:
     def capture(self, text_len: int, *, capture_self: bool = False):
         self.text_len = text_len
         self.maps = {}
+        self.head_maps = {}
         self.self_maps = {}
         self._active_self_blocks = self.self_blocks if capture_self else []
         handles = []
@@ -145,6 +157,32 @@ class AttentionCollector:
         finally:
             for h in handles:
                 h.remove()
+
+    def heads_tensor(self) -> torch.Tensor:
+        """Return [B,total_heads,N_output] for selected blocks in their listed order.
+
+        Individual heads are aligned across forwards by block name and head index.
+        This tensor remains differentiable during the latent guidance forward.
+        """
+        if not self.capture_heads:
+            raise RuntimeError("Individual head capture is disabled")
+        missing = set(self.blocks) - set(self.head_maps)
+        if missing:
+            raise RuntimeError(f"Head maps missing from hooks: {sorted(missing)}")
+        return torch.cat([self.head_maps[name] for name in self.blocks], dim=1)
+
+    def head_labels(self) -> list[str]:
+        """Stable identifiers, e.g. D2:H03, matching heads_tensor columns."""
+        if not self.capture_heads:
+            raise RuntimeError("Individual head capture is disabled")
+        missing = set(self.blocks) - set(self.head_maps)
+        if missing:
+            raise RuntimeError(f"Head maps missing from hooks: {sorted(missing)}")
+        return [
+            f"{name}:H{index:02d}"
+            for name in self.blocks
+            for index in range(self.head_maps[name].shape[1])
+        ]
 
     def mean_self_map(self) -> torch.Tensor:
         """Average normalized output-image self-attention over chosen blocks."""
